@@ -1,0 +1,248 @@
+package main
+
+import (
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+	_ "github.com/go-sql-driver/mysql"
+)
+
+var (
+	db  *sql.DB
+	mu  sync.Mutex
+	sem = make(chan struct{}, 5) // limit concurrent saves
+)
+
+func main() {
+	// Logging
+	logFile, _ := os.OpenFile("excelvc.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	log.SetOutput(logFile)
+
+	// Connect to DB
+	var err error
+	db, err = sql.Open("mysql", "root:root123@tcp(localhost:3306)/excelvc?parseTime=true")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	// Start Desktop watcher
+	go watch(desktopPath())
+
+	// Web interface
+	http.HandleFunc("/", listFiles)
+	http.HandleFunc("/versions", listVersions)
+	http.HandleFunc("/restore", restoreVersion)
+
+	log.Println("ExcelVC running at http://localhost:8080")
+	http.ListenAndServe(":8080", nil)
+}
+
+// Desktop path
+func desktopPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Desktop")
+}
+
+/* =================== WATCHER =================== */
+
+func watch(dir string) {
+	fmt.Println("dir", dir)
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer watcher.Close()
+
+	watcher.Add(dir)
+
+	for {
+		select {
+		case e := <-watcher.Events:
+			if e.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+				if isExcel(e.Name) && !strings.HasPrefix(filepath.Base(e.Name), "~$") {
+					sem <- struct{}{}
+					go func(p string) {
+						defer func() { <-sem }()
+						saveVersion(p)
+					}(e.Name)
+				}
+			}
+		}
+	}
+}
+
+func isExcel(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".xls" || ext == ".xlsx"
+}
+
+func isLocked(path string) bool {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0666)
+	if err != nil {
+		return true
+	}
+	f.Close()
+	return false
+}
+
+func saveVersion(path string) {
+	waitStable(path)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Println("Failed to read file:", err)
+		return
+	}
+
+	hash := sha(data)
+	fmt.Println("hassh", hash)
+	mu.Lock()
+	defer mu.Unlock()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+	var (
+		id       int
+		lastHash sql.NullString
+	)
+	// Get or create file entry
+
+	err = tx.QueryRow("SELECT id FROM excel_files WHERE file_path=?", path).Scan(&id, &lastHash)
+	if err == sql.ErrNoRows {
+		r, _ := tx.Exec(
+			"INSERT INTO excel_files(file_path,file_name,last_hash) VALUES(?,?,?)",
+			path, filepath.Base(path), hash)
+		i, _ := r.LastInsertId()
+		id = int(i)
+	} else if lastHash.Valid && lastHash.String == hash {
+		// 🔴 SAME CONTENT → DO NOT SAVE
+		return
+	}
+
+	// Always save a new version
+	var v int
+	tx.QueryRow(
+		"SELECT COALESCE(MAX(version_number),0)+1 FROM excel_versions WHERE file_id=?",
+		id).Scan(&v)
+
+	tx.Exec(
+		"INSERT INTO excel_versions(file_id,version_number,file_data) VALUES(?,?,?)",
+		id, v, compress(data))
+
+	// Update last_hash
+	tx.Exec("UPDATE excel_files SET last_hash=? WHERE id=?", hash, id)
+
+	tx.Commit()
+	log.Println("Saved version", v, "for", path)
+}
+
+func waitStable(path string) {
+	var last int64 = -1
+	for {
+		info, err := os.Stat(path)
+		if err != nil {
+			return
+		}
+		if info.Size() == last {
+			return
+		}
+		last = info.Size()
+		time.Sleep(400 * time.Millisecond)
+	}
+}
+
+func sha(data []byte) string {
+	s := sha256.Sum256(data)
+	return hex.EncodeToString(s[:])
+}
+
+func compress(data []byte) []byte {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+
+	gz.Write(data)
+	gz.Close()
+	return buf.Bytes()
+}
+
+func decompress(data []byte) []byte {
+	r, _ := gzip.NewReader(bytes.NewReader(data))
+	out, _ := io.ReadAll(r)
+
+	r.Close()
+	return out
+}
+
+/* =================== WEB INTERFACE =================== */
+
+func listFiles(w http.ResponseWriter, _ *http.Request) {
+	rows, _ := db.Query("SELECT id, file_name FROM excel_files")
+	fmt.Fprintln(w, "<html><body><h2>Excel Files</h2>")
+	for rows.Next() {
+		var id int
+		var name string
+		rows.Scan(&id, &name)
+		fmt.Fprintf(w, `<a href="/versions?id=%d">%s</a><br>`, id, name)
+	}
+	fmt.Fprintln(w, "</body></html>")
+}
+
+func listVersions(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	rows, _ := db.Query(`
+		SELECT version_number, created_at
+		FROM excel_versions
+		WHERE file_id=?
+		ORDER BY created_at DESC
+	`, id)
+
+	fmt.Fprintln(w, "<html><body><h2>Versions</h2>")
+	for rows.Next() {
+		var v int
+		var t time.Time
+		rows.Scan(&v, &t)
+		fmt.Fprintf(w,
+			`<a href="/restore?id=%s&v=%d">Version %d - %s</a><br>`,
+			id, v, v, t.Format("2006-01-02 15:04:05"))
+	}
+	fmt.Fprintln(w, "</body></html>")
+}
+
+func restoreVersion(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	v := r.URL.Query().Get("v")
+
+	var path string
+	db.QueryRow("SELECT file_path FROM excel_files WHERE id=?", id).Scan(&path)
+
+	var data []byte
+	db.QueryRow(
+		"SELECT file_data FROM excel_versions WHERE file_id=? AND version_number=?",
+		id, v).Scan(&data)
+
+	if len(data) == 0 {
+		fmt.Fprintln(w, "Version data not found")
+		return
+	}
+	
+
+	os.WriteFile(path, decompress(data), 0644)
+	fmt.Fprintln(w, "Restored successfully:", path)
+}
